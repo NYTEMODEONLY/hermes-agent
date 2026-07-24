@@ -16,6 +16,7 @@ from acp.schema import (
     AgentThoughtChunk,
     AuthenticateResponse,
     AvailableCommandsUpdate,
+    ClientCapabilities,
     Implementation,
     InitializeResponse,
     LoadSessionResponse,
@@ -88,6 +89,17 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
 
 
 class TestInitialize:
+    @pytest.mark.asyncio
+    async def test_initialize_enables_buzz_detached_task_visibility(self, agent):
+        await agent.initialize(
+            protocol_version=1,
+            client_capabilities=ClientCapabilities(
+                field_meta={"buzz": {"detachedTaskVisibility": True}}
+            ),
+        )
+
+        assert agent._detached_task_visibility is True
+
     @pytest.mark.asyncio
     async def test_initialize_returns_correct_protocol_version(self, agent):
         resp = await agent.initialize(protocol_version=1)
@@ -1124,6 +1136,90 @@ class TestSessionConfiguration:
 
 
 class TestPrompt:
+    @pytest.mark.asyncio
+    async def test_prompt_waits_for_kanban_task_when_client_supports_visibility(
+        self, agent
+    ):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        agent._detached_task_visibility = True
+
+        def run_with_kanban(*args, **kwargs):
+            state.agent.tool_progress_callback(
+                "tool.started",
+                "kanban_create",
+                None,
+                {"title": "Ship it", "assignee": "developer", "board": "release"},
+            )
+            state.agent.step_callback(
+                1,
+                [
+                    {
+                        "name": "kanban_create",
+                        "result": '{"ok":true,"task_id":"t_ship","status":"running"}',
+                        "arguments": {"board": "release"},
+                    }
+                ],
+            )
+            return {"final_response": "Work is running.", "messages": []}
+
+        state.agent.run_conversation = run_with_kanban
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        agent._wait_for_detached_tasks = AsyncMock()
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="ship it")],
+            session_id=new_resp.session_id,
+        )
+
+        agent._wait_for_detached_tasks.assert_awaited_once_with(
+            new_resp.session_id,
+            [("t_ship", "release")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_detached_task_wait_emits_active_and_settled_metadata(self, agent):
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        agent._read_detached_task_states = MagicMock(
+            side_effect=[
+                [
+                    {
+                        "taskId": "t_ship",
+                        "board": None,
+                        "status": "running",
+                        "title": "Ship it",
+                    }
+                ],
+                [
+                    {
+                        "taskId": "t_ship",
+                        "board": None,
+                        "status": "done",
+                        "title": "Ship it",
+                    }
+                ],
+            ]
+        )
+
+        with patch("acp_adapter.server.asyncio.sleep", new=AsyncMock()):
+            await agent._wait_for_detached_tasks(
+                "session-1",
+                [("t_ship", None)],
+            )
+
+        states = [
+            (
+                (call.kwargs.get("update") or call.args[1]).field_meta
+                or {}
+            )["hermes"]["detachedTasks"]["state"]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        assert states == ["active", "settled"]
+
     @pytest.mark.asyncio
     async def test_prompt_returns_refusal_for_unknown_session(self, agent):
         prompt = [TextContentBlock(type="text", text="hello")]

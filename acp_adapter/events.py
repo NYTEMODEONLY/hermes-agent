@@ -212,6 +212,7 @@ def make_step_cb(
     loop: asyncio.AbstractEventLoop,
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
+    detached_task_cb: Callable[[str, str | None], None] | None = None,
 ) -> Callable:
     """Create a ``step_callback`` for AIAgent.
 
@@ -253,6 +254,23 @@ def make_step_cb(
                         plan_update = _build_plan_update_from_todo_result(result)
                         if plan_update is not None:
                             _send_update(conn, session_id, loop, plan_update)
+                    if tool_name == "kanban_create" and detached_task_cb is not None:
+                        try:
+                            parsed = json.loads(result) if isinstance(result, str) else result
+                            if isinstance(parsed, dict) and parsed.get("ok") is True:
+                                task_id = str(parsed.get("task_id") or "").strip()
+                                args = function_args or meta.get("args") or {}
+                                board = args.get("board") if isinstance(args, dict) else None
+                                if task_id:
+                                    detached_task_cb(
+                                        task_id,
+                                        str(board).strip() if board else None,
+                                    )
+                        except Exception:
+                            logger.debug(
+                                "Failed to register detached Kanban task from ACP result",
+                                exc_info=True,
+                            )
                     if not queue:
                         tool_call_ids.pop(tool_name, None)
 

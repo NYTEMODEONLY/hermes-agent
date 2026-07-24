@@ -166,6 +166,34 @@ class TestThinkingCallback:
 
 
 class TestStepCallback:
+    def test_registers_successful_kanban_create_for_detached_visibility(
+        self, mock_conn, event_loop_fixture
+    ):
+        tool_call_ids = {"kanban_create": "tc-kanban"}
+        registered = MagicMock()
+        cb = make_step_cb(
+            mock_conn,
+            "session-1",
+            event_loop_fixture,
+            tool_call_ids,
+            {},
+            detached_task_cb=registered,
+        )
+
+        with patch("acp_adapter.events._send_update"):
+            cb(
+                1,
+                [
+                    {
+                        "name": "kanban_create",
+                        "result": '{"ok":true,"task_id":"t_abc123","status":"running"}',
+                        "arguments": {"board": "shipping"},
+                    }
+                ],
+            )
+
+        registered.assert_called_once_with("t_abc123", "shipping")
+
     def test_completes_tracked_tool_calls(self, mock_conn, event_loop_fixture):
         """Step callback should mark tracked tools as completed."""
         tool_call_ids = {"terminal": "tc-abc123"}

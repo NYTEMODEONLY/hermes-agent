@@ -526,6 +526,7 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._detached_task_visibility = False
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -884,6 +885,17 @@ class HermesACPAgent(acp.Agent):
             client_name,
             resolved_protocol_version,
         )
+        capability_meta = (
+            client_capabilities.field_meta
+            if client_capabilities is not None
+            and isinstance(client_capabilities.field_meta, dict)
+            else {}
+        )
+        buzz_capabilities = capability_meta.get("buzz", {})
+        self._detached_task_visibility = bool(
+            isinstance(buzz_capabilities, dict)
+            and buzz_capabilities.get("detachedTaskVisibility") is True
+        )
 
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
@@ -899,6 +911,84 @@ class HermesACPAgent(acp.Agent):
             ),
             auth_methods=auth_methods,
         )
+
+    @staticmethod
+    def _read_detached_task_states(
+        task_refs: list[tuple[str, str | None]],
+    ) -> list[dict[str, str | None]]:
+        """Read the current state of Kanban tasks created by one ACP turn."""
+        from hermes_cli import kanban_db as kb
+
+        states: list[dict[str, str | None]] = []
+        for task_id, board in task_refs:
+            try:
+                conn = kb.connect(board=board)
+                try:
+                    task = kb.get_task(conn, task_id)
+                finally:
+                    conn.close()
+            except Exception:
+                logger.debug(
+                    "Could not read detached Kanban task %s", task_id, exc_info=True
+                )
+                task = None
+            states.append(
+                {
+                    "taskId": task_id,
+                    "board": board,
+                    "status": task.status if task is not None else "unknown",
+                    "title": task.title if task is not None else None,
+                }
+            )
+        return states
+
+    async def _wait_for_detached_tasks(
+        self,
+        session_id: str,
+        task_refs: list[tuple[str, str | None]],
+    ) -> None:
+        """Keep a capable ACP client's turn alive until spawned work settles.
+
+        Buzz uses the still-open prompt as the authoritative working signal.
+        Status snapshots ride on standard ``session_info_update`` metadata so
+        observer consumers also get durable lifecycle receipts without parsing
+        assistant prose.
+        """
+        if not task_refs:
+            return
+
+        terminal_statuses = {"done", "archived", "blocked"}
+        previous_snapshot: list[dict[str, str | None]] | None = None
+        while True:
+            snapshot = await asyncio.to_thread(
+                self._read_detached_task_states,
+                task_refs,
+            )
+            if snapshot != previous_snapshot and self._conn is not None:
+                all_terminal = all(
+                    str(item.get("status") or "") in terminal_statuses
+                    for item in snapshot
+                )
+                update = SessionInfoUpdate(
+                    session_update="session_info_update",
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                    field_meta={
+                        "hermes": {
+                            "detachedTasks": {
+                                "state": "settled" if all_terminal else "active",
+                                "tasks": snapshot,
+                            }
+                        }
+                    },
+                )
+                await self._conn.session_update(session_id, update)
+                previous_snapshot = snapshot
+            if all(
+                str(item.get("status") or "") in terminal_statuses
+                for item in snapshot
+            ):
+                return
+            await asyncio.sleep(2)
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         # Only accept authenticate() calls whose method_id matches the
@@ -1504,12 +1594,18 @@ class HermesACPAgent(acp.Agent):
 
         tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
         tool_call_meta: dict[str, dict[str, Any]] = {}
+        detached_task_refs: list[tuple[str, str | None]] = []
         previous_approval_cb = None
         edit_approval_requester = None
 
         streamed_message = False
 
         if conn:
+            def register_detached_task(task_id: str, board: str | None) -> None:
+                ref = (task_id, board)
+                if ref not in detached_task_refs:
+                    detached_task_refs.append(ref)
+
             tool_progress_cb = make_tool_progress_cb(
                 conn,
                 session_id,
@@ -1519,7 +1615,14 @@ class HermesACPAgent(acp.Agent):
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
-            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            step_cb = make_step_cb(
+                conn,
+                session_id,
+                loop,
+                tool_call_ids,
+                tool_call_meta,
+                detached_task_cb=register_detached_task,
+            )
             message_cb = make_message_cb(conn, session_id, loop)
 
             def stream_delta_cb(text: str) -> None:
@@ -1681,6 +1784,13 @@ class HermesACPAgent(acp.Agent):
             state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
             self.session_manager.save_session(session_id)
+
+        if (
+            self._detached_task_visibility
+            and detached_task_refs
+            and not (state.cancel_event and state.cancel_event.is_set())
+        ):
+            await self._wait_for_detached_tasks(session_id, detached_task_refs)
 
         # Detect a compression-driven internal session rotation. If the agent's
         # DB head moved during the turn, emit a session_info_update carrying
